@@ -30,6 +30,11 @@ string SCHEDALG = "FIFO";
 string LOGFILE = "/dev/null";
 
 vector<HttpService *> services;
+deque<MySocket *> reqQueue;
+
+pthread_mutex_t queueLock = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t newRequest = PTHREAD_COND_INITIALIZER;
+pthread_cond_t queueHasRoom = PTHREAD_COND_INITIALIZER;
 
 HttpService *find_service(HTTPRequest *request) {
    // find a service that is registered for this path prefix
@@ -104,6 +109,24 @@ void handle_request(MySocket *client) {
   delete client;
 }
 
+void* worker(void* arg){
+  while(true){
+    dthread_mutex_lock(&queueLock);
+    while(reqQueue.empty()){
+      dthread_cond_wait(&newRequest, &queueLock);
+    }
+
+    MySocket *client = reqQueue.front();
+    reqQueue.pop_front();
+    dthread_cond_signal(&queueHasRoom);
+
+    dthread_mutex_unlock(&queueLock);
+    handle_request(client);
+  }
+
+  return NULL;
+}
+
 int main(int argc, char *argv[]) {
 
   signal(SIGPIPE, SIG_IGN);
@@ -144,11 +167,24 @@ int main(int argc, char *argv[]) {
   // The order that you push services dictates the search order
   // for path prefix matching
   services.push_back(new FileService(BASEDIR));
+
+  for(int i=0; i<THREAD_POOL_SIZE; i++){
+    pthread_t threadID;
+    dthread_create(&threadID, NULL, worker, NULL);
+    dthread_detach(threadID);
+  }
   
   while(true) {
     sync_print("waiting_to_accept", "");
     client = server->accept();
     sync_print("client_accepted", "");
-    handle_request(client);
+
+    dthread_mutex_lock(&queueLock);
+    while ((int) reqQueue.size() >= BUFFER_SIZE){
+      dthread_cond_wait(&queueHasRoom, &queueLock);
+    }
+    reqQueue.push_back(client);
+    dthread_cond_broadcast(&newRequest);
+    dthread_mutex_unlock(&queueLock);
   }
 }
